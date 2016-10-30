@@ -1,0 +1,202 @@
+#!/bin/bash
+
+process_tree() 
+{
+pid="$1"
+
+indentation=$(printf '%*s' "$indent" | tr ' ' "\t")
+
+[[ "$$" -eq "$pid" ]] && printf "$yellow" 
+
+this_process=$(ps -o pid= -o cmd= -p $pid | perl -pe 's/^\s+// ; s/\s+/,/')
+
+if (( no_bash )) && (echo "$this_process" | grep -q -E ',/bin/bash$') ; then
+	for child in $(ps -o pid --no-headers --ppid $pid) ; do process_tree $child ; done
+else
+	printf "$indentation$green$this_process$reset\n"
+
+	indent=$((indent + 1))
+	export indentation=$(printf '%*s' "$indent" | tr ' ' "\t")
+
+	if (( files )) ; then
+		if (( lsof )) ; then
+			lsof -p $pid | perl -ane 'print "$ENV{indentation}$_" if $F[8] ne "/bin/bash"'
+		else
+			lsof -p $pid | perl -ane 'print "$ENV{indentation}$F[8]\n" if $F[8] ne "/bin/bash" && $F[4] eq "REG" && $F[3] ne "mem" '
+		fi
+	fi
+
+	for child in $(ps -o pid --no-headers --ppid $pid) ; do 
+		process_tree $child
+	done
+
+	indent=$((indent - 1))
+fi
+}
+
+parse_it () 
+{
+reg_ex=$1
+string=$2
+shift 2
+
+[[ $string =~ $reg_ex ]] || return 
+
+i=1
+for name; do
+	declare -g "$name=${BASH_REMATCH[i++]}"
+done
+}
+
+tmux_ls() 
+{
+# option variables
+tmux= ; tmuxake= ; no_tmuxake= ; processes= ; files= ; lsof= ; pwd_on= ; no_bash=
+
+while :; do
+	case $1 in
+		-h|--help) cat << 'EOH'
+NAME
+	tmux-ls - list information about tmux, pids, and files
+
+SYNOPSIS
+	tmux-ls [option] [options ...]
+
+DESCRIPTION
+	When using tmux, did you ever wanted to edit a file and got an error
+	message telling you that another instance of the editor has the same
+	file open? Did you have multiple panes, windows, sessions where the
+	editor could have been running? Was the editor running in a detached
+	session? Did you have to look everywhere for the editor?
+
+	tmux-ls, without any option displays a set of information about tmux.
+	The set contains, sessions, windows and panes; which process is run
+	in the pane and what files that process has opened.
+	
+OPTIONS
+	--tmux            only show tmux information: session, windows, ...   
+
+	-t|--tmuxake      shows tmuxake status for each pane
+
+	-p|--process      show the pid and the command for each pane 
+	
+	-f|--file         show only the files opened by the process, calls
+	                  lsof for each process, slow but very useful
+	
+	--pwd             Displays the current directory
+	--no-bash         Skip display of information about /bin/bash
+
+	--lsof            show the complete output of lsof
+
+	--no-color        do not colorize output
+
+	The default optioons are: --tmux --tmuxake --process --file --no-bash
+
+BUGS/GITHUB
+	Report on github or via mail, patches are welcome.
+	https://github.com/nkh/tmux-ls
+
+AUTHOR/LICENSE
+	Nadim Khemir <nadim dot khemir at gmail dot com>
+	Artistic license 2.0
+
+SEE ALSO
+	lsof(8)
+ 
+EOH
+		exit	;;
+
+		-t  | --tmux        ) processes=0 ;;
+		-ta | --tmuxake     ) tmuxake=1 ;;
+		      --no-tmuxake  ) no_tmuxake=1 ;;
+		-p  | --processes   ) processes=1 ;;
+		-f  | --files       ) files=1 ;;
+		      --lsof        ) lsof=1 ;;
+		      --pwd         ) pwd_on=1 ;;
+		      --no-bash     ) no_bash=1 ;;
+		      --no-color    ) light_blue= ; cyan= ; yellow= ; green= ; red= ; reset= ;;
+		-?*                 ) printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2 ;;
+		*                   ) break
+	esac
+
+	shift
+done
+
+if [[ -z $processes && -z $tmux && -z $tmuxake && -z $files && -z $lsof && -z $no_bash ]] ; then
+	processes=1 ; tmux=1 ; tmuxake=1 ; files=1 ; no_bash=1
+fi
+
+if [[ -n $no_tmuxake ]] ; then tmuxake=0 ; fi
+if [[ -n $lsof ]] ; then files=1 ; fi
+if [[ -n $files ]] ; then processes=1 ; fi
+
+for s in `tmux list-sessions -F '#{session_id}:#{session_name}'` ; do
+	parse_it '(.*):(.*)' "$s" session_id session_name
+	
+	number_of_windows=$(tmux list-windows -t "$session_id" | wc -l)
+	if (( number_of_windows == 1 )) ; then number_of_windows='' ; else number_of_windows=", $number_of_windows windows" ; fi
+
+	session_attached=$(tmux display -p -F '#{session_attached}' -t "$session_id")
+	if (( session_attached == 1 )) ; then session_attached='' ; else session_attached=", attached: $session_attached" ; fi
+
+	echo -e "${light_blue}s:$s$number_of_windows$session_attached$reset"
+
+	for w in $(tmux list-windows -F '#{window_id}XX#{window_index}XX#{window_name}' -t "$session_id") ; do
+		
+		parse_it '(.*)XX(.*)XX(.*)' "$w" window_id window_index window_name
+
+		number_of_panes=$(tmux list-panes -t ""$session_id":"$window_index"" | wc -l)
+		if (( number_of_panes == 1 )) ; then number_of_panes='' ; else number_of_panes=", $number_of_panes panes" ; fi
+
+		indent=$((indent + 1))
+		indentation=$(printf '%*s' "$indent" | tr ' ' "\t")
+
+		printf "$indentation${light_blue}w:$window_id:[$window_name]$number_of_panes$reset\n"
+	
+		for p in $(tmux list-panes -F '#{pane_id}:#{pane_index}:#{pane_pid}' -t ""$session_id":"$window_index"") ; do
+
+			parse_it '(.*):(.*):(.*)' "$p" pane_id pane_index pane_pid
+
+			if (( tmuxake )) ; then
+				tmuxake_status="$(tmuxake-status-pane-pid $pane_pid)$(tmuxake-check-pane-pid $pane_pid)"
+			fi
+
+			indent=$((indent + 1))
+			indentation=$(printf '%*s' "$indent" | tr ' ' "\t")
+
+			pane_size=$(tmux display -p -F '#{pane_width} x #{pane_height}' -t "$session_id:$window_index.$pane_index")
+
+			printf "${light_blue}${indentation}p:$pane_index, $pane_size $cyan$tmuxake_status$reset\n"
+
+			if (( pwd_on )) ; then
+				pane_wd=$(tmux display -p -F '#{pane_current_path}' -t "$session_id:$window_index.$pane_index")
+				printf "${indentation}\tcwd:$pane_wd\n"
+			fi
+
+			if (( processes )) ; then
+				indent=$((indent + 1))
+				process_tree  $pane_pid
+				indent=$((indent - 1))
+			fi
+
+			indent=$((indent - 1))
+		done
+		
+		indent=$((indent - 1))
+
+	done
+done
+}
+
+USE_TMUXAKE_LIB=1
+if tmuxake_lib=$(which tmuxake) ; then 
+	source $tmuxake_lib
+else
+	tmuxake-check-pane-pid() { x=0 ; }
+	tmuxake-status-pane-pid() { x=0 ; }
+fi	
+
+tmux_ls $@
+
+
+
